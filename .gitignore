@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# uv
+.uv/
+
+# Project
+clips/            # recorded landmark fixtures (large, regenerable)
+*.log
+
+# macOS
+.DS_Store
+
+# Session tooling
+.remember/
