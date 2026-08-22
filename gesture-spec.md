@@ -249,8 +249,8 @@ Target: **sub-200ms** from the swipe crossing the velocity threshold to the keys
 | HandLandmarker inference (CPU, M-series) | 5–15ms |
 | Classifier + state machine | <1ms |
 | Direction-consistency confirmation (4 frames) | ~130ms |
-| Keystroke dispatch (`PAUSE = 0`) | <5ms |
-| **Total** | **~140–190ms** |
+| Keystroke dispatch (`pynput`, measured) | <0.1ms |
+| **Total** | **~138–181ms** |
 
 Two lines dominate and both are configuration, not algorithms: the capture thread (worth 60–100ms) and `pyautogui.PAUSE` (worth 100ms). Get those right before optimizing anything else.
 
@@ -262,14 +262,26 @@ Two lines dominate and both are configuration, not algorithms: the capture threa
 
 Abstract behind an `ActionDispatcher` class so the keystroke backend is swappable — this is also what makes Windows/Linux support additive later.
 
-**`pyautogui` gotchas that must be set explicitly:**
+**Use `pynput`, not `pyautogui`.** Measured on this machine (50 iterations, macOS arm64, dispatching a bare modifier key):
+
+| Backend | median | p95 |
+|---|---|---|
+| `pyautogui`, default `PAUSE = 0.1` | 127.8ms | 130.3ms |
+| `pyautogui`, `PAUSE = 0` | 24.5ms | 25.3ms |
+| raw Quartz `CGEventCreateKeyboardEvent` | 0.04ms | 0.14ms |
+| **`pynput`** | **0.03ms** | **0.04ms** |
+
+`pyautogui`'s remaining ~24ms after zeroing `PAUSE` is its own per-call overhead, and it is not tunable away. That is 5× the original budget for this stage and ~12% of the end-to-end target, spent on nothing. `pynput` and raw Quartz are both effectively free.
+
+`pynput` is the default because it is cross-platform, so the `ActionDispatcher` abstraction actually pays off when Windows/Linux arrive. Raw Quartz is an equally fast macOS-only fallback if `pynput` ever becomes a problem — keycode 124 is Right, 123 is Left.
+
+Note the cold-start penalty: the *first* dispatch in a fresh process is slower than steady state (~70ms for `pyautogui`, ~0.1ms for `pynput`). Send one throwaway keystroke to a harmless key at startup so the first real gesture isn't the one that pays it.
+
+If `pyautogui` is used anyway for some reason, both of these are mandatory:
 ```python
 pyautogui.PAUSE    = 0       # default 0.1s sleeps after EVERY call
 pyautogui.FAILSAFE = False   # default aborts on cursor in a screen corner
 ```
-The default `PAUSE` alone consumes half the latency budget.
-
-Consider `pynput` or raw Quartz `CGEventCreateKeyboardEvent` as the backend — both have lower per-call overhead than `pyautogui`. With `ActionDispatcher` in place this is a one-file swap, so start with `pyautogui` and only move if measurement justifies it.
 
 ---
 
@@ -383,7 +395,7 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | `OPEN_PALM` ignores the thumb | Least reliable landmark group, no benefit |
 | Specified `VIDEO` mode explicitly | `LIVE_STREAM` silently drops frames |
 | Added capture thread | AVFoundation buffers 2–3 frames; `CAP_PROP_BUFFERSIZE` is often ignored on macOS |
-| Added `pyautogui.PAUSE = 0` | Default 0.1s sleep consumes half the latency budget |
+| Backend switched to `pynput`; `pyautogui.PAUSE = 0` | Measured: `pyautogui` costs ~24ms/keystroke even with `PAUSE = 0`, vs 0.03ms for `pynput` |
 | Documented mirroring and direction conventions | Classic multi-hour bug |
 | Fire on velocity crossing, not completed displacement | Displacement-window confirmation cannot feel instant |
 | Removed the `DETECTING` state | The ring buffer already is that state |

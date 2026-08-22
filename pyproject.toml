@@ -13,7 +13,11 @@ dependencies = [
     "mediapipe==0.10.35",
     # cv2 comes from mediapipe's own opencv-contrib-python (a superset of
     # opencv-python). Do not add opencv-python: both claim the `cv2` module.
-    "pyautogui>=0.9.54",
+    # pynput dispatches a keystroke in ~0.03ms vs ~24ms for pyautogui even with
+    # PAUSE=0 (measured, 50 iters, macOS arm64). It is also cross-platform, so
+    # the ActionDispatcher abstraction pays off for Windows/Linux later.
+    "pynput>=1.7",
+    "pyautogui>=0.9.54",  # spikes only - not the production dispatch path
     "pyobjc-framework-ApplicationServices>=10.0",  # AXIsProcessTrusted()
 ]
 

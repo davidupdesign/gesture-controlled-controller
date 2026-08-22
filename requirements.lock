@@ -24,6 +24,7 @@ pyautogui==0.9.54
 pycparser==3.0
 pygetwindow==0.0.9
 pymsgbox==2.0.1
+pynput==1.8.2
 pyobjc-core==12.2.2
 pyobjc-framework-applicationservices==12.2.2
 pyobjc-framework-cocoa==12.2.2
