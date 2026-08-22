@@ -1,0 +1,27 @@
+[project]
+name = "gesture-controlled-controller"
+version = "0.1.0"
+description = "Control an already-open presentation with webcam hand gestures."
+requires-python = ">=3.11,<3.13"
+
+dependencies = [
+    # mediapipe 1.0.x aborts on macOS arm64: the HandLandmarker graph hits
+    # `DrishtiMetalHelper` and dies with "Check failed: service_ Service is
+    # unavailable" for every running_mode and delegate combination.
+    # 0.10.35 is the newest version in the same wheel lineage that works.
+    # Verified 2026-08-22 on darwin arm64 / cp312. Retest before raising.
+    "mediapipe==0.10.35",
+    # cv2 comes from mediapipe's own opencv-contrib-python (a superset of
+    # opencv-python). Do not add opencv-python: both claim the `cv2` module.
+    "pyautogui>=0.9.54",
+    "pyobjc-framework-ApplicationServices>=10.0",  # AXIsProcessTrusted()
+]
+
+# This is an application, not an importable library. Without this, setuptools'
+# flat-layout auto-discovery treats models/ and spikes/ as packages and fails.
+[tool.setuptools]
+packages = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

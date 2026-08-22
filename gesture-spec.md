@@ -23,9 +23,9 @@ Everything downstream depends on this number and it is currently a guess. A pres
 Go stand where you will actually present, and measure. Record the answer here before proceeding:
 
 ```
-MEASURED_DISTANCE_M   = ____
+MEASURED_DISTANCE_M   = 1.5   # provisional, sits exactly on the full-frame/ROI boundary
 VENUE_LIGHTING        = ____  (bright / normal / dim / backlit)
-CAMERA                = ____  (built-in / external model)
+CAMERA                = built-in
 ROI_CROP_REQUIRED     = ____  (determined by Spike B)
 ```
 
@@ -71,6 +71,16 @@ Do **not** use `cvzone`. It wraps MediaPipe with convenience helpers but hides r
 Use **`VIDEO` mode** (`detect_for_video(image, timestamp_ms)`) with monotonically increasing timestamps.
 
 Do **not** use `LIVE_STREAM` mode. It is asynchronous with a result callback and silently drops frames under load — the exact failure the velocity calculation is sensitive to. `VIDEO` mode is synchronous and processes every frame you hand it.
+
+### Environment (verified 2026-08-22, darwin arm64 / cp312)
+
+| Pin | Why |
+|---|---|
+| `mediapipe==0.10.35` | **`mediapipe` 1.0.x is unusable here.** `HandLandmarker` creation aborts (SIGABRT) in `DrishtiMetalHelper` with `Check failed: service_ Service is unavailable`, for every `running_mode` × `delegate` combination. 0.10.35 is the newest working version in the same wheel lineage. Retest before raising the pin. |
+| `cv2` from `opencv-contrib-python` only | `opencv-python` and `opencv-contrib-python` both own the `cv2` namespace. Installing both, then removing either, leaves an importable but empty `cv2` husk. `mediapipe` already depends on `opencv-contrib-python`, which is a superset — never add `opencv-python` alongside it. |
+| Python 3.12.13 via `uv` | System Python is 3.9.6; `mediapipe` needs 3.11/3.12. |
+
+Reproduce with `uv venv --python 3.12 && uv pip install -e .`; `requirements.lock` holds the exact resolved set.
 
 ---
 
