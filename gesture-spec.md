@@ -265,7 +265,15 @@ These are informed starting points, not derived constants. Every one of them is 
 |---|---|---|---|---|
 | all tracked frames | 0.5–0.8 | 2.2–2.9 | 2.7–3.9 | 4.5–6.3 |
 
-`SWIPE_MIN_VELOCITY = 8.0` currently sits above the p99 of everything recorded. **That does not yet mean it is too high**, and the distinction matters: these runs are unlabeled, so it is unknown how many deliberate swipes they contain. The fast phase of a swipe lasts roughly 6 frames, so ten swipes in a minute occupy ~3% of frames and would live above p97 — inside the tail the summary is reporting, not beyond it. A percentile summary structurally cannot separate "swipes are slower than assumed" from "swipes are too rare to surface." Only the labeled fixture set (steps 7 and 9) can settle it, which is the reason that harness exists.
+The second run's final ~10 seconds were confirmed deliberate left/right swipes — about **15% of its frames**, so swipe frames sit above roughly p85 and the p90/p95/p99 figures above are *sampling* the swipe population rather than bounding it.
+
+**Two conclusions follow.**
+
+`SWIPE_MIN_VELOCITY = 8.0` is too high. It sits above the p99 of a run that is one-sixth deliberate swipes; almost no swipe frame would cross it. The real range looks like 3–6 palm-lengths/sec.
+
+More importantly, **the distributions overlap**. Ambient motion reached p99 = 4.5 in the swipe-free run, *above* where deliberate swipes commonly sat (p95 = 3.9) in the swipe-containing one. Velocity alone cannot separate intent. This is the project's central risk, arriving exactly where *The hard problems* predicted: the arming height gate, the pose gate, and direction consistency must carry the discrimination, with velocity as a supporting filter rather than the primary signal. A design that leans on a velocity threshold to tell a swipe from a gesticulation will not work.
+
+The precise value is still not settled from these numbers, and deliberately so — twice now a threshold has been set from summary statistics and had to be revised. It gets fitted against the labeled fixture set in step 9 or not at all.
 
 ```python
 # Arming
