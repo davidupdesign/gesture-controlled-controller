@@ -1,6 +1,7 @@
 """Gesture-controlled presentation controller.
 
-Build steps 3-5: capture, hand tracking, and pose classification. Per the spec, steps 3-6 live in this one file; it splits
+Build steps 3-6: capture, hand tracking, pose classification, and the motion
+buffer. Per the spec, steps 3-6 live in this one file; it splits
 into capture/gestures/actions/config/hud once the ring buffer lands.
 
     python controller.py                      # preview window
@@ -22,6 +23,7 @@ The spec budgets 0-33ms for this stage. `--headless --seconds N` measures it.
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import statistics as st
 import threading
@@ -71,6 +73,14 @@ FINGER_JOINTS = {
 }
 FINGER_NAMES = tuple(FINGER_JOINTS)
 EXTENDED_RATIO = 1.15      # tip must be this much further from the wrist than the joint
+
+# Motion buffer. Velocity is always expressed in PALM-LENGTHS per second, never
+# in normalized image units, so a threshold means the same physical gesture at
+# 0.4m and at 1.5m - a 4x difference in apparent hand size.
+RING_BUFFER_S = 0.5
+BUFFER_GAP_MS = 150        # a longer gap invalidates the buffer entirely
+VELOCITY_LOOKBACK_S = 0.1  # window for the velocity estimate (~3 frames at 30fps)
+PALM_SMOOTH_N = 5          # median over this many frames, to steady the scale unit
 
 
 @dataclass(frozen=True)
@@ -337,6 +347,106 @@ class HandTracker:
         self.close()
 
 
+@dataclass(frozen=True)
+class Sample:
+    """One buffered instant of wrist motion, in aspect-corrected normalized units."""
+    t: float
+    x: float
+    y: float
+    palm: float
+
+
+class MotionBuffer:
+    """Time-indexed ring buffer of wrist positions, yielding palm-normalized velocity.
+
+    Two decisions here are load-bearing:
+
+    Derivatives are taken against wall-clock time, never against frame counts.
+    Frames will be dropped no matter how carefully the loop is written, and a
+    frame-indexed derivative silently reports a fast gesture when it was really
+    a slow one across a gap.
+
+    A gap longer than `gap_ms` clears the buffer outright. Without that, a hand
+    that occludes mid-swipe and returns produces an enormous spurious velocity
+    across the discontinuity and fires immediately. This is the single most
+    likely phantom-fire bug in the system.
+    """
+
+    def __init__(self, window_s: float = RING_BUFFER_S, gap_ms: float = BUFFER_GAP_MS,
+                 palm_smooth_n: int = PALM_SMOOTH_N):
+        self._window_s = window_s
+        self._gap_s = gap_ms / 1000.0
+        self._samples: collections.deque[Sample] = collections.deque()
+        self._palms: collections.deque[float] = collections.deque(maxlen=palm_smooth_n)
+        self.gap_invalidations = 0
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def clear(self) -> None:
+        self._samples.clear()
+        self._palms.clear()
+
+    def append(self, obs: HandObservation) -> bool:
+        """Add an observation. Returns False if it invalidated the buffer.
+
+        The palm scale is a running median rather than the instantaneous value:
+        a single bad frame's palm estimate would otherwise rescale every
+        velocity derived from it.
+        """
+        gapped = bool(self._samples) and (obs.captured_at - self._samples[-1].t) > self._gap_s
+        if gapped:
+            self.clear()
+            self.gap_invalidations += 1
+
+        self._palms.append(obs.palm)
+        palm = st.median(self._palms)
+
+        wx, wy, _ = obs.landmarks[WRIST]
+        self._samples.append(Sample(obs.captured_at, wx * obs.aspect, wy, palm))
+
+        cutoff = obs.captured_at - self._window_s
+        while self._samples and self._samples[0].t < cutoff:
+            self._samples.popleft()
+        return not gapped
+
+    def _span(self, lookback_s: float) -> tuple[Sample, Sample] | None:
+        """Oldest sample within `lookback_s` of the newest, paired with the newest."""
+        if len(self._samples) < 2:
+            return None
+        newest = self._samples[-1]
+        oldest = self._samples[0]
+        for sample in self._samples:
+            if newest.t - sample.t <= lookback_s:
+                oldest = sample
+                break
+        if oldest is newest or newest.t <= oldest.t:
+            return None
+        return oldest, newest
+
+    def velocity(self, lookback_s: float = VELOCITY_LOOKBACK_S) -> tuple[float, float] | None:
+        """(vx, vy) in palm-lengths per second, or None if there is not enough data."""
+        span = self._span(lookback_s)
+        if span is None:
+            return None
+        oldest, newest = span
+        dt = newest.t - oldest.t
+        palm = newest.palm
+        if palm <= 0:
+            return None
+        return ((newest.x - oldest.x) / palm / dt, (newest.y - oldest.y) / palm / dt)
+
+    def displacement(self) -> tuple[float, float] | None:
+        """(dx, dy) in palm-lengths across the whole buffer."""
+        if len(self._samples) < 2:
+            return None
+        oldest, newest = self._samples[0], self._samples[-1]
+        palm = newest.palm
+        if palm <= 0:
+            return None
+        return ((newest.x - oldest.x) / palm, (newest.y - oldest.y) / palm)
+
+
 def fingers_up(obs: HandObservation) -> tuple[bool, ...]:
     """Which fingers are extended, as (thumb, index, middle, ring, pinky).
 
@@ -415,6 +525,9 @@ def main() -> int:
     palms: list[float] = []
     confs: list[float] = []
     open_palm_frames = 0
+    buffer = MotionBuffer()
+    vx_all: list[float] = []          # |vx| every tracked frame
+    vx_open: list[float] = []         # |vx| while OPEN_PALM - the gesture-relevant set
     gaps: list[float] = []            # continuous tracking dropouts, seconds
     frames = repeats = hits = 0
     last_index = -1
@@ -446,6 +559,7 @@ def main() -> int:
                 obs = None
                 fingers: tuple[bool, ...] = ()
                 open_palm = False
+                velocity = None
                 if tracker is not None:
                     obs = tracker.process(frame)
                     if obs is not None:
@@ -455,6 +569,12 @@ def main() -> int:
                         fingers = fingers_up(obs)
                         open_palm = is_open_palm(fingers)
                         open_palm_frames += open_palm
+                        buffer.append(obs)
+                        velocity = buffer.velocity()
+                        if velocity is not None:
+                            vx_all.append(abs(velocity[0]))
+                            if open_palm:
+                                vx_open.append(abs(velocity[0]))
                         if miss_run_start is not None:
                             gaps.append(now - miss_run_start)
                             miss_run_start = None
@@ -475,11 +595,13 @@ def main() -> int:
                         f"loop: {frames / max(elapsed, 1e-6):5.1f} fps   "
                         f"track: {hits / max(frames, 1) * 100:5.1f}%",
                         f"fingers: {format_fingers(fingers)}" if obs else "fingers: -----",
-                        f"OPEN PALM" if open_palm else "-",
+                        "OPEN PALM" if open_palm else "-",
+                        f"vx: {velocity[0]:+7.1f} palm/s" if velocity
+                        else "vx:      -- palm/s",
                         f"palm: {obs.palm_px:5.1f} px  conf: {obs.confidence:.2f}"
                         if obs else "palm:    -- px",
                     ])
-                    cv2.imshow("controller - step 5 pose", view)
+                    cv2.imshow("controller - step 6 motion", view)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 
@@ -516,6 +638,17 @@ def main() -> int:
             print(f"confidence     median={st.median(confs):.2f}  min={min(confs):.2f}")
         print(f"open palm      {open_palm_frames} frames "
               f"({open_palm_frames / max(hits, 1) * 100:.1f}% of tracked)")
+        print(f"buffer         {buffer.gap_invalidations} gap invalidations "
+              f"(> {BUFFER_GAP_MS:.0f}ms)")
+        for label, series in (("|vx| all", vx_all), ("|vx| open palm", vx_open)):
+            if not series:
+                continue
+            v = sorted(series)
+            print(f"{label:14} p50={st.median(v):5.1f}  p90={percentile(v, .90):5.1f}  "
+                  f"p95={percentile(v, .95):5.1f}  p99={percentile(v, .99):5.1f}  "
+                  f"max={v[-1]:5.1f}  palm/s")
+        if vx_open:
+            print("               -> SWIPE_MIN_VELOCITY must sit above ordinary motion")
         print(f"rejected       confidence={tracker.rejected['confidence']}  "
               f"palm_px={tracker.rejected['palm_px']}")
         if gaps:
