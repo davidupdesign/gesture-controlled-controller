@@ -191,11 +191,16 @@ This is rotation-invariant and handedness-agnostic.
 Arming is therefore **implicit, continuous, and non-toggling**:
 
 - Wrist above `ARM_Y_LINE` **and** `OPEN_PALM`, sustained for `ARM_ENTER_MS` → **ARMED**
-- Wrist below the line, hand lost, or pose broken, sustained for `ARM_EXIT_MS` → **DISARMED**
+- Wrist visible but below the line, or pose broken, sustained for `ARM_EXIT_BELOW_MS` → **DISARMED**
+- Hand not detected at all, sustained for `ARM_EXIT_LOST_MS` → **DISARMED**
 
 No hold gesture. No timer. No toggle. The height gate *is* the arming mechanism. Dropping your arm is the panic stop, which is exactly the reflex you want under stress.
 
-Asymmetric hysteresis: enter fast (~250ms) so the control feels responsive; exit slow (~1200ms) so a momentary tracking dropout mid-swipe does not disarm you.
+Asymmetric hysteresis: enter fast (~250ms) so the control feels responsive; exit slow so a momentary tracking dropout mid-swipe does not disarm you.
+
+**Tracking loss and hand-lowering need separate timeouts** — an earlier version of this spec shared one, and measurement showed that fails. Over 44.5s of ordinary hand movement the tracker dropped out 10 times: median 35ms (a single frame, harmless), but **longest 1135ms**, against a shared `ARM_EXIT_MS` of 1200ms. A 65ms margin means a glitch barely worse than one already observed would silently disarm you mid-presentation.
+
+The two signals mean different things. A hand *visible but below the line* is a deliberate stand-down, so disarm promptly. A hand *not detected at all* is usually a tracking glitch, so tolerate far longer — and tolerating it is cheap, because a hand the model cannot see cannot produce a swipe either. Nothing can fire during the extra window.
 
 ### Status feedback (required, not optional)
 
@@ -222,13 +227,14 @@ Three states plus a cooldown. The v1 spec's `DETECTING` state is unnecessary —
 
 ```
 DISARMED --[open palm above line, ARM_ENTER_MS]--> ARMED
-ARMED    --[below line / lost / pose broken, ARM_EXIT_MS]--> DISARMED
+ARMED    --[visible but below line / pose broken, ARM_EXIT_BELOW_MS]--> DISARMED
+ARMED    --[no hand detected, ARM_EXIT_LOST_MS]--> DISARMED
 ARMED    --[swipe confirmed]--> FIRED --[COOLDOWN_MS]--> ARMED
 ```
 
 Clear the ring buffer on every transition into `ARMED` and into `COOLDOWN`. A buffer carried across a state change is a phantom-fire waiting to happen.
 
-**Buffer gap invalidation.** If the interval between consecutive buffered samples exceeds `BUFFER_GAP_MS`, discard the buffer. Without this, a hand that occludes or leaves frame mid-swipe and returns produces an enormous spurious velocity and fires immediately. This is the most likely phantom-fire bug in the whole system.
+**Buffer gap invalidation.** If the interval between consecutive buffered samples exceeds `BUFFER_GAP_MS`, discard the buffer. Measurement supports the 150ms default: of 10 observed dropouts, 9 were at or near a single frame (35ms median) and only 1 exceeded 150ms, so the threshold passes ordinary blips and catches genuine loss. Without this, a hand that occludes or leaves frame mid-swipe and returns produces an enormous spurious velocity and fires immediately. This is the most likely phantom-fire bug in the whole system.
 
 ---
 
@@ -240,7 +246,8 @@ These are informed starting points, not derived constants. Every one of them is 
 # Arming
 ARM_Y_LINE            = 0.45    # normalized; wrist above this (upper 45% of frame)
 ARM_ENTER_MS          = 250
-ARM_EXIT_MS           = 1200
+ARM_EXIT_BELOW_MS     = 400     # hand visible but low: deliberate, disarm promptly
+ARM_EXIT_LOST_MS      = 2000    # tracking lost: usually a glitch (measured max 1135ms)
 
 # Swipe (all distances in palm-lengths)
 SWIPE_MIN_VELOCITY    = 8.0     # palm-lengths / second
@@ -430,5 +437,6 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Cut fist → blank screen | Relaxed hand reads as partial fist; highest-cost false positive |
 | Added tuning harness and fixture set (steps 7, 9) | A gesture classifier cannot be tuned interactively |
 | Added *Definition of done* with measurable criteria | v1 had no acceptance criteria at all |
+| Split `ARM_EXIT_MS` into `ARM_EXIT_BELOW_MS` / `ARM_EXIT_LOST_MS` | Measured a 1135ms tracking dropout against a 1200ms shared timeout — 65ms from silently disarming mid-presentation |
 | `ROI_CROP_REQUIRED = False`; added `MIN_PALM_PX` | Spike B: ROI cropped 1.8 points *off* detection by clipping swipe volume; a 6.3px palm was detected, which is impossible |
 | Noted resolution bumps don't help at distance | Palm detector downsamples to a fixed small square; ROI cropping is the actual fix |
