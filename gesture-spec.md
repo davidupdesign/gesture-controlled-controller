@@ -23,10 +23,10 @@ Everything downstream depends on this number and it is currently a guess. A pres
 Go stand where you will actually present, and measure. Record the answer here before proceeding:
 
 ```
-MEASURED_DISTANCE_M   = 1.5   # provisional, sits exactly on the full-frame/ROI boundary
-VENUE_LIGHTING        = ____  (bright / normal / dim / backlit)
-CAMERA                = built-in
-ROI_CROP_REQUIRED     = ____  (determined by Spike B)
+MEASURED_DISTANCE_M   = 1.5
+VENUE_LIGHTING        = ____  (still untested - see Lighting under The hard problems)
+CAMERA                = built-in (MacBook Pro Camera)
+ROI_CROP_REQUIRED     = False  # settled by Spike B, 2026-08-23
 ```
 
 ---
@@ -133,11 +133,20 @@ The **capture thread** is not optional. OpenCV's AVFoundation backend on macOS b
 
 ## Detection at distance
 
-MediaPipe's pipeline begins with a palm *detector* that resizes its input to a small fixed square (roughly 192×192) regardless of what you feed it. **Capturing at higher resolution does not help** — a 60px-wide hand in a 1280px frame becomes ~9px at the detector's input.
+**Settled by Spike B at 1.5m, full-frame, 1280×720:**
 
-If `ROI_CROP_REQUIRED`, crop a fixed region (the upper-center of the frame, where gestures are performed anyway) and upscale it before inference. Map landmark coordinates back to full-frame space afterwards, or — simpler — keep everything in ROI-local coordinates and define the height gate relative to the ROI.
+| Mode | Detection | `PALM px` median | Inference median |
+|---|---|---|---|
+| **Full-frame** | **91.2%** | 39.3 | 5.1ms |
+| ROI 0.50 crop | 89.4% | 37.6 | 5.1ms |
 
-Note that once the landmarker has acquired a hand it tracks using the previous frame's ROI and holds on far better than it acquires. **Cold-start acquisition at distance is the hard case**; a system that looks fine once you've waved close to the camera may never acquire from a standing start.
+Both figures include the walk to and from the camera, during which no hand was in view, so each understates steady-state tracking. Confidence while tracking was 0.98 median.
+
+**ROI cropping is not required, and at this distance it is counterproductive.** It bought no detection and cost 1.8 points. The mechanism matters for anyone tempted to revisit it: cropping helps only when the hand is too *small* for the detector, and at 1.5m a 39px palm is already sufficient. What the crop does do is discard field of view — and a swipe is a large lateral hand movement, so the ROI box throws away precisely the volume the gesture needs. For this gesture set, cropping trades away the thing that matters.
+
+Keep this section because the reasoning still applies if the geometry changes. MediaPipe's palm detector resizes its input to a small fixed square (roughly 192×192) regardless of capture resolution, so **raising capture resolution does not help a small hand** — a 60px hand in a 1280px frame is ~9px at the detector. Cropping and upscaling is the only lever, and it is worth reaching for only past roughly 2m, where the palm drops under ~25px. If it is ever re-enabled, the crop must be wide enough to contain a full swipe.
+
+Note also that once the landmarker has acquired a hand it tracks from the previous frame's ROI and holds on far better than it acquires. **Cold-start acquisition is the hard case** — a system that looks fine after you have waved close to the camera may never acquire from a standing start.
 
 ---
 
@@ -227,6 +236,7 @@ SWIPE_MAX_Y_DRIFT     = 1.5     # palm-lengths; rejects diagonal flails
 
 # Gating
 MIN_CONFIDENCE        = 0.6
+MIN_PALM_PX           = 20      # reject impossible detections; Spike B logged a 6.3px "palm"
 BUFFER_GAP_MS         = 150
 RING_BUFFER_S         = 0.5
 
@@ -246,7 +256,7 @@ Target: **sub-200ms** from the swipe crossing the velocity threshold to the keys
 |---|---|
 | Frame staleness (latest-frame capture thread) | 0–33ms |
 | Colour convert + ROI crop + resize | ~2ms |
-| HandLandmarker inference (CPU, M-series) | 5–15ms |
+| HandLandmarker inference (measured, M4 Max) | 5.1ms med / 7.5ms p95 |
 | Classifier + state machine | <1ms |
 | Direction-consistency confirmation (4 frames) | ~130ms |
 | Keystroke dispatch (`pynput`, measured) | <0.1ms |
@@ -402,4 +412,5 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Cut fist → blank screen | Relaxed hand reads as partial fist; highest-cost false positive |
 | Added tuning harness and fixture set (steps 7, 9) | A gesture classifier cannot be tuned interactively |
 | Added *Definition of done* with measurable criteria | v1 had no acceptance criteria at all |
+| `ROI_CROP_REQUIRED = False`; added `MIN_PALM_PX` | Spike B: ROI cropped 1.8 points *off* detection by clipping swipe volume; a 6.3px palm was detected, which is impossible |
 | Noted resolution bumps don't help at distance | Palm detector downsamples to a fixed small square; ROI cropping is the actual fix |
