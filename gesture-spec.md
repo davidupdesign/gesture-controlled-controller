@@ -207,9 +207,17 @@ No hold gesture. No timer. No toggle. The height gate *is* the arming mechanism.
 
 Asymmetric hysteresis: enter fast (~250ms) so the control feels responsive; exit slow so a momentary tracking dropout mid-swipe does not disarm you.
 
-**Tracking loss and hand-lowering need separate timeouts** — an earlier version of this spec shared one, and measurement showed that fails. Over 44.5s of ordinary hand movement the tracker dropped out 10 times: median 35ms (a single frame, harmless), but **longest 1135ms**, against a shared `ARM_EXIT_MS` of 1200ms. A 65ms margin means a glitch barely worse than one already observed would silently disarm you mid-presentation.
+**Tracking loss and hand-lowering need separate timeouts** — an earlier version of this spec shared one, and measurement showed that fails. A hand *visible but below the line* is a deliberate stand-down, so disarm promptly. A hand *not detected at all* may be a tracking glitch, so tolerate longer.
 
-The two signals mean different things. A hand *visible but below the line* is a deliberate stand-down, so disarm promptly. A hand *not detected at all* is usually a tracking glitch, so tolerate far longer — and tolerating it is cheap, because a hand the model cannot see cannot produce a swipe either. Nothing can fire during the extra window.
+**How long is "longer" cannot be read off the dropout data, and it is worth being explicit about why.** Two runs measured maximum dropouts of 1135ms and 2849ms, and the second exceeded a threshold chosen to clear the first. Chasing that number is futile, because **the dropout metric is confounded**: it cannot distinguish the tracker losing a hand that was present from there being no hand because the presenter lowered it. Most long dropouts are the latter. Only the short ones — 34–35ms median, a single frame — are unambiguously glitches.
+
+So set `ARM_EXIT_LOST_MS` from the design instead:
+
+- Any dropout longer than `BUFFER_GAP_MS` (150ms) already invalidates the ring buffer, so **an in-flight swipe is lost regardless of whether arming survived**. Keeping the arm latched through a long gap buys nothing.
+- The risk of a latched arm is not during the gap — a hand the model cannot see cannot swipe — but **at the moment the hand returns**, when the first incidental motion can fire without ever re-satisfying the arming condition.
+- Re-arming costs only `ARM_ENTER_MS` (250ms), which is cheap.
+
+800ms therefore rides out genuine blips by a wide margin while never leaving a stale arm latched behind a hand that has simply gone away.
 
 ### Status feedback (required, not optional)
 
@@ -256,7 +264,8 @@ These are informed starting points, not derived constants. Every one of them is 
 ARM_Y_LINE            = 0.45    # normalized; wrist above this (upper 45% of frame)
 ARM_ENTER_MS          = 250
 ARM_EXIT_BELOW_MS     = 400     # hand visible but low: deliberate, disarm promptly
-ARM_EXIT_LOST_MS      = 2000    # tracking lost: usually a glitch (measured max 1135ms)
+ARM_EXIT_LOST_MS      = 800     # tracking lost: long enough to ride out blips,
+                                # short enough not to leave arming latched
 
 # Swipe (all distances in palm-lengths)
 SWIPE_MIN_VELOCITY    = 8.0     # palm-lengths / second
@@ -446,6 +455,6 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Cut fist → blank screen | Relaxed hand reads as partial fist; highest-cost false positive |
 | Added tuning harness and fixture set (steps 7, 9) | A gesture classifier cannot be tuned interactively |
 | Added *Definition of done* with measurable criteria | v1 had no acceptance criteria at all |
-| Split `ARM_EXIT_MS` into `ARM_EXIT_BELOW_MS` / `ARM_EXIT_LOST_MS` | Measured a 1135ms tracking dropout against a 1200ms shared timeout — 65ms from silently disarming mid-presentation |
+| Split `ARM_EXIT_MS` into `ARM_EXIT_BELOW_MS` / `ARM_EXIT_LOST_MS`, the latter set from design at 800ms | A shared timeout sat 65ms from a measured dropout. The replacement is *not* calibrated from dropout maxima (1135ms then 2849ms — the metric conflates tracker glitches with a lowered hand) but from the fact that any gap past `BUFFER_GAP_MS` already loses the swipe, so a latched arm only adds risk on the hand's return |
 | `ROI_CROP_REQUIRED = False`; added `MIN_PALM_PX` | Spike B: ROI cropped 1.8 points *off* detection by clipping swipe volume; a 6.3px palm was detected, which is impossible |
 | Noted resolution bumps don't help at distance | Palm detector downsamples to a fixed small square; ROI cropping is the actual fix |
