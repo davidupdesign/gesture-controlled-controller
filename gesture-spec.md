@@ -296,7 +296,8 @@ BUFFER_GAP_MS         = 150
 RING_BUFFER_S         = 0.5
 
 # Debounce
-COOLDOWN_MS           = 900
+COOLDOWN_MS           = 600     # same direction: advancing twice quickly is legitimate
+COOLDOWN_REVERSE_MS   = 1200    # opposite direction: almost always a return stroke
 ```
 
 **Single-frame velocity spikes are real, and `SWIPE_CONSISTENT_N` is what stops them.** Live runs recorded instantaneous `|vx|` maxima of 109 and 220 palm-lengths/sec — a hand moving ~20 m/s, physically impossible. These are landmark glitches, not buffer discontinuities: the run with the 220 palm/s spike had *zero* gap invalidations. Velocity thresholding on its own would fire on every one. Requiring consecutive same-direction frames is therefore not a refinement, it is load-bearing, and no velocity threshold should ever be applied without it.
@@ -391,6 +392,19 @@ The false-fire number is the one that matters. A controller that misses a swipe 
 
 ## The hard problems
 
+**The return stroke.** The largest false-positive source measured so far, and one this spec originally missed entirely. A swipe is only half a movement: having swept the hand right, the presenter brings it back. That return is an open-palm lateral motion at qualifying velocity — indistinguishable from a deliberate swipe by pose, height, speed, and direction consistency alike. It fires the opposite command.
+
+Measured over 78s of deliberate swiping: **28 fires, exactly 14 next and 14 prev**. That balance is the signature — every real swipe produced a phantom twin. Of the 27 intervals between consecutive fires, 13 were under 900ms, and **13 of those 13 were direction reversals — 100%**. Same-direction gaps were never below 2 seconds.
+
+That asymmetry is the fix. A **direction-aware cooldown** suppresses reversals for far longer than repeats, because a return stroke is *always* a reversal, while advancing two slides quickly is a legitimate thing to want:
+
+```
+COOLDOWN_MS         = 600    # same direction
+COOLDOWN_REVERSE_MS = 1200   # opposite direction
+```
+
+Against the measured data this suppresses every one of the 13 phantom fires while touching no same-direction swipe. Note what does *not* work: a plain 900ms cooldown leaves 21 of the 28 fires standing, and clearing the classifier's spent flag on direction reversal actively causes the problem, since the reversal is exactly what releases the run.
+
 **False positives during natural speech.** A presenter gestures constantly while talking. Mitigations, layered — each one alone is insufficient:
 - *Arming* (implicit height gate + pose, above) — the primary defence
 - *Pose gate*: `OPEN_PALM` required throughout the swipe, not just at its start
@@ -478,6 +492,7 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Removed the `DETECTING` state | The ring buffer already is that state |
 | `SWIPE_MIN_DISPLACE` 2.5 → 0.8 | 2.5 is incompatible with firing on velocity: 4 frames at the floor travel ~0.5 palm-lengths, so 2.5 forces a ~600ms wait and reintroduces completed-gesture latency |
 | Debounce via a spent-run flag, not reset-after-fire | Resetting still double-fires because the hand is still moving when confirmed; a 20-frame sweep fired three times |
+| Added a direction-aware cooldown for return strokes | Measured 28 fires from ~14 swipes, split exactly 14/14; 13 of 13 sub-900ms re-fires were reversals. The return half of every swipe was firing the opposite command |
 | Cut fist → blank screen | Relaxed hand reads as partial fist; highest-cost false positive |
 | Added tuning harness and fixture set (steps 7, 9) | A gesture classifier cannot be tuned interactively |
 | Added *Definition of done* with measurable criteria | v1 had no acceptance criteria at all |
