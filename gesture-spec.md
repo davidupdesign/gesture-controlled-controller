@@ -259,6 +259,14 @@ Clear the ring buffer on every transition into `ARMED` and into `COOLDOWN`. A bu
 
 These are informed starting points, not derived constants. Every one of them is expected to move during the tuning pass. Expose them in `config.py`.
 
+**Measured motion, ~1.2m, unlabeled** (two runs, 112s, `|vx|` in palm-lengths/sec):
+
+| | p50 | p90 | p95 | p99 |
+|---|---|---|---|---|
+| all tracked frames | 0.5–0.8 | 2.2–2.9 | 2.7–3.9 | 4.5–6.3 |
+
+`SWIPE_MIN_VELOCITY = 8.0` currently sits above the p99 of everything recorded. **That does not yet mean it is too high**, and the distinction matters: these runs are unlabeled, so it is unknown how many deliberate swipes they contain. The fast phase of a swipe lasts roughly 6 frames, so ten swipes in a minute occupy ~3% of frames and would live above p97 — inside the tail the summary is reporting, not beyond it. A percentile summary structurally cannot separate "swipes are slower than assumed" from "swipes are too rare to surface." Only the labeled fixture set (steps 7 and 9) can settle it, which is the reason that harness exists.
+
 ```python
 # Arming
 ARM_Y_LINE            = 0.45    # normalized; wrist above this (upper 45% of frame)
@@ -282,6 +290,8 @@ RING_BUFFER_S         = 0.5
 # Debounce
 COOLDOWN_MS           = 900
 ```
+
+**Single-frame velocity spikes are real, and `SWIPE_CONSISTENT_N` is what stops them.** Live runs recorded instantaneous `|vx|` maxima of 109 and 220 palm-lengths/sec — a hand moving ~20 m/s, physically impossible. These are landmark glitches, not buffer discontinuities: the run with the 220 palm/s spike had *zero* gap invalidations. Velocity thresholding on its own would fire on every one. Requiring consecutive same-direction frames is therefore not a refinement, it is load-bearing, and no velocity threshold should ever be applied without it.
 
 **Fire on velocity-threshold crossing, not on completed displacement.** Confirm with `SWIPE_CONSISTENT_N` same-direction frames (~130ms at 30fps) rather than waiting for the full gesture to finish. This is the difference between "instant" and "laggy" and costs nothing in false-positive rate, because the pose and height gates are doing the real filtering.
 
