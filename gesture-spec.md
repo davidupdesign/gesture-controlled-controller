@@ -127,7 +127,19 @@ main loop:
   -> status HUD update
 ```
 
-The **capture thread** is not optional. OpenCV's AVFoundation backend on macOS buffers 2–3 frames, and `CAP_PROP_BUFFERSIZE` is frequently ignored there. A thread that continuously grabs and overwrites a single-slot latest-frame is the reliable fix and is likely your largest latency saving after `pyautogui.PAUSE`.
+**Measured 2026-08-23, and the earlier claim here was wrong.** This spec previously asserted that AVFoundation buffers 2–3 frames, that `CAP_PROP_BUFFERSIZE` is ignored, and that a capture thread was the largest latency saving after `pyautogui.PAUSE`. None of that holds on this machine.
+
+| Load | Threaded | Direct |
+|---|---|---|
+| 5.1ms work (realistic) | 26.8 fps, 35% of a core | 27.5 fps, 32% of a core |
+| 50ms work (overloaded) | 18.0 fps | 13.7 fps |
+| 80ms work (overloaded) | 11.4 fps | 9.1 fps |
+
+At the real workload the two are equivalent — the thread is worth nothing measurable. It pays off only when the consumer is slower than the camera, where it recovers 25–31% by taking `read()`'s blocking time off the critical path. The buffer is also shallow, not deep: direct-mode `read()` blocks 17–20ms rather than returning instantly from a backlog.
+
+**Keep the capture thread anyway, but as insurance rather than optimization.** Under overload it degrades the right way — it drops stale frames instead of queueing them — which matters on unknown venue hardware or a thermally throttled machine. It is not load-bearing for latency, so do not spend effort tuning it.
+
+**The main loop must wait for a new frame, not poll.** Polling `read()` at 5.1ms work spins at 179 fps and re-processes the same frame 85% of the time: 104% of a core to produce identical results. Blocking on a condition variable until the frame index advances gives 26.8 fps at 35% — same output, a third of the CPU.
 
 ---
 
@@ -254,15 +266,18 @@ Target: **sub-200ms** from the swipe crossing the velocity threshold to the keys
 
 | Stage | Budget @ 30fps |
 |---|---|
-| Frame staleness (latest-frame capture thread) | 0–33ms |
+| Camera-side latency (sensor → `read()` returns) | **unmeasured** |
+| Pipeline-side staleness (measured) | 0.1ms med / 1.7ms max |
 | Colour convert + ROI crop + resize | ~2ms |
 | HandLandmarker inference (measured, M4 Max) | 5.1ms med / 7.5ms p95 |
 | Classifier + state machine | <1ms |
 | Direction-consistency confirmation (4 frames) | ~130ms |
 | Keystroke dispatch (`pynput`, measured) | <0.1ms |
-| **Total** | **~138–181ms** |
+| **Total (pipeline only)** | **~138ms + camera latency** |
 
 Two lines dominate and both are configuration, not algorithms: the capture thread (worth 60–100ms) and `pyautogui.PAUSE` (worth 100ms). Get those right before optimizing anything else.
+
+**One term remains unmeasured and it may dominate.** Everything above is measured from the moment `read()` returns. The time from photons hitting the sensor to `read()` returning — driver, USB, and camera pipeline — is invisible from inside the process and is typically 20–50ms on a webcam. Measuring it needs an external reference: point the camera at a millisecond clock, capture a frame, and compare the displayed time against the frame's arrival time. Worth doing before claiming the sub-200ms target is met.
 
 **Instrument this.** Log the timestamp of the frame that triggered the fire and the timestamp after dispatch. A latency budget you cannot measure is a wish.
 
@@ -404,7 +419,7 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Pose classification changed to radial distance from wrist | y-vs-PIP breaks on hand roll and is wrong for the thumb |
 | `OPEN_PALM` ignores the thumb | Least reliable landmark group, no benefit |
 | Specified `VIDEO` mode explicitly | `LIVE_STREAM` silently drops frames |
-| Added capture thread | AVFoundation buffers 2–3 frames; `CAP_PROP_BUFFERSIZE` is often ignored on macOS |
+| Capture thread demoted to insurance; main loop waits rather than polls | Measured: thread is worth ~0 at realistic load (26.8 vs 27.5 fps) and 25–31% only under overload; the AVFoundation deep-buffering claim was false. Polling burns 104% of a core for identical output |
 | Backend switched to `pynput`; `pyautogui.PAUSE = 0` | Measured: `pyautogui` costs ~24ms/keystroke even with `PAUSE = 0`, vs 0.03ms for `pynput` |
 | Documented mirroring and direction conventions | Classic multi-hour bug |
 | Fire on velocity crossing, not completed displacement | Displacement-window confirmation cannot feel instant |
