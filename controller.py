@@ -1,6 +1,6 @@
 """Gesture-controlled presentation controller.
 
-Build steps 3-4: capture and hand tracking. Per the spec, steps 3-6 live in this one file; it splits
+Build steps 3-5: capture, hand tracking, and pose classification. Per the spec, steps 3-6 live in this one file; it splits
 into capture/gestures/actions/config/hud once the ring buffer lands.
 
     python controller.py                      # preview window
@@ -22,6 +22,7 @@ The spec budgets 0-33ms for this stage. `--headless --seconds N` measures it.
 from __future__ import annotations
 
 import argparse
+import math
 import statistics as st
 import threading
 import time
@@ -56,6 +57,20 @@ HAND_CONNECTIONS = [
     (5, 9), (9, 13), (13, 17),                 # palm
 ]
 WRIST, MIDDLE_MCP = 0, 9
+
+# (tip, reference joint) per finger. Extension is judged by radial distance from
+# the wrist, not by y-position against the PIP: y-comparison breaks the moment
+# the hand rolls or tilts, and is simply wrong for the thumb, which extends
+# laterally with a handedness-dependent sign.
+FINGER_JOINTS = {
+    "thumb":  (4, 2),      # tip vs MCP - the thumb has no comparable PIP
+    "index":  (8, 6),
+    "middle": (12, 10),
+    "ring":   (16, 14),
+    "pinky":  (20, 18),
+}
+FINGER_NAMES = tuple(FINGER_JOINTS)
+EXTENDED_RATIO = 1.15      # tip must be this much further from the wrist than the joint
 
 
 @dataclass(frozen=True)
@@ -213,6 +228,29 @@ class HandObservation:
     confidence: float
     captured_at: float
     frame_index: int
+    aspect: float = 1.0      # width/height; normalized x is squashed without it
+
+    def dist(self, a: int, b: int) -> float:
+        """Aspect-corrected distance between two landmarks, in normalized-y units.
+
+        MediaPipe normalizes x and y independently against a non-square image,
+        so raw normalized x and y are not the same unit. Any magnitude mixing
+        the two axes must correct for that first or it is silently wrong.
+        """
+        ax, ay, _ = self.landmarks[a]
+        bx, by, _ = self.landmarks[b]
+        return math.hypot((ax - bx) * self.aspect, ay - by)
+
+    @property
+    def palm(self) -> float:
+        """Wrist-to-middle-MCP length. The scale every threshold divides by.
+
+        Expressing distances in palm-lengths is what makes a threshold mean the
+        same physical gesture at 0.4m and at 1.5m. Spike B measured the palm at
+        163.8px close up and 39.3px at 1.5m - a 4x swing that any fixed
+        image-normalized threshold would get wrong at one end or the other.
+        """
+        return self.dist(WRIST, MIDDLE_MCP)
 
 
 class HandTracker:
@@ -286,6 +324,7 @@ class HandTracker:
             confidence=confidence,
             captured_at=frame.captured_at,
             frame_index=frame.index,
+            aspect=w / h,
         )
 
     def close(self) -> None:
@@ -298,15 +337,45 @@ class HandTracker:
         self.close()
 
 
-def draw_landmarks(view, obs: HandObservation, width: int, height: int) -> None:
+def fingers_up(obs: HandObservation) -> tuple[bool, ...]:
+    """Which fingers are extended, as (thumb, index, middle, ring, pinky).
+
+    Rotation-invariant and handedness-agnostic: a finger is extended when its
+    tip is measurably further from the wrist than its reference joint, which
+    holds however the hand is oriented.
+    """
+    return tuple(
+        obs.dist(tip, WRIST) > obs.dist(joint, WRIST) * EXTENDED_RATIO
+        for tip, joint in FINGER_JOINTS.values()
+    )
+
+
+def is_open_palm(fingers: tuple[bool, ...]) -> bool:
+    """All four non-thumb fingers extended.
+
+    The thumb is deliberately ignored. It is the least reliable landmark group,
+    and including it buys nothing here - it only adds a way for a genuine open
+    palm to be rejected.
+    """
+    return all(fingers[1:])
+
+
+def format_fingers(fingers: tuple[bool, ...]) -> str:
+    """Compact readout: 'TIMRP' all up, '.IMRP' thumb down."""
+    return "".join(n[0].upper() if up else "." for n, up in zip(FINGER_NAMES, fingers))
+
+
+def draw_landmarks(view, obs: HandObservation, width: int, height: int,
+                   open_palm: bool = False) -> None:
     """Draw the hand skeleton onto the MIRRORED preview.
 
     `view` is already flipped for display, so x is mirrored here - the sole
     place in the codebase where that happens.
     """
+    colour = (0, 255, 120) if open_palm else (140, 140, 140)
     pts = [(width - int(x * width), int(y * height)) for x, y, _ in obs.landmarks]
     for a, b in HAND_CONNECTIONS:
-        cv2.line(view, pts[a], pts[b], (0, 255, 120), 2)
+        cv2.line(view, pts[a], pts[b], colour, 2)
     for pt in pts:
         cv2.circle(view, pt, 3, (0, 200, 255), -1)
 
@@ -345,6 +414,7 @@ def main() -> int:
     staleness: list[float] = []
     palms: list[float] = []
     confs: list[float] = []
+    open_palm_frames = 0
     gaps: list[float] = []            # continuous tracking dropouts, seconds
     frames = repeats = hits = 0
     last_index = -1
@@ -374,12 +444,17 @@ def main() -> int:
                 frames += 1
 
                 obs = None
+                fingers: tuple[bool, ...] = ()
+                open_palm = False
                 if tracker is not None:
                     obs = tracker.process(frame)
                     if obs is not None:
                         hits += 1
                         palms.append(obs.palm_px)
                         confs.append(obs.confidence)
+                        fingers = fingers_up(obs)
+                        open_palm = is_open_palm(fingers)
+                        open_palm_frames += open_palm
                         if miss_run_start is not None:
                             gaps.append(now - miss_run_start)
                             miss_run_start = None
@@ -394,16 +469,17 @@ def main() -> int:
                     view = cv2.flip(frame.image, 1)
                     h, w = view.shape[:2]
                     if obs is not None:
-                        draw_landmarks(view, obs, w, h)
+                        draw_landmarks(view, obs, w, h, open_palm)
                     elapsed = now - t_start
                     draw_hud(view, [
                         f"loop: {frames / max(elapsed, 1e-6):5.1f} fps   "
-                        f"stale: {staleness[-1] if staleness else 0:4.1f} ms",
                         f"track: {hits / max(frames, 1) * 100:5.1f}%",
-                        f"palm: {obs.palm_px:5.1f} px" if obs else "palm:    -- px",
-                        f"conf: {obs.confidence:.2f}" if obs else "conf:  --",
+                        f"fingers: {format_fingers(fingers)}" if obs else "fingers: -----",
+                        f"OPEN PALM" if open_palm else "-",
+                        f"palm: {obs.palm_px:5.1f} px  conf: {obs.confidence:.2f}"
+                        if obs else "palm:    -- px",
                     ])
-                    cv2.imshow("controller - step 4 hand tracking", view)
+                    cv2.imshow("controller - step 5 pose", view)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 
@@ -438,6 +514,8 @@ def main() -> int:
                   f"min={min(palms):.1f}  max={max(palms):.1f}")
         if confs:
             print(f"confidence     median={st.median(confs):.2f}  min={min(confs):.2f}")
+        print(f"open palm      {open_palm_frames} frames "
+              f"({open_palm_frames / max(hits, 1) * 100:.1f}% of tracked)")
         print(f"rejected       confidence={tracker.rejected['confidence']}  "
               f"palm_px={tracker.rejected['palm_px']}")
         if gaps:

@@ -182,6 +182,15 @@ extended(finger) = dist(tip, wrist) > dist(pip, wrist) * 1.15
 ```
 This is rotation-invariant and handedness-agnostic.
 
+**Validated against a synthetic hand swept through 360°** (`tests/test_pose.py`):
+
+| Classifier | Open hand correctly classified, 72 orientations |
+|---|---|
+| Radial distance from wrist (shipped) | **72/72 — 100%** |
+| Naive `tip.y < pip.y` | 23/72 — **32%** |
+
+The naive method is not broken everywhere, which is precisely what makes it dangerous: it works in the narrow band where the hand is upright and fails across the other 49 orientations. That is a bug which passes every desk test and then fails on stage, where hands are held at whatever angle is comfortable.
+
 **Define `OPEN_PALM` as all four non-thumb fingers extended.** Ignore the thumb entirely. Thumb state is the least reliable landmark group and it buys nothing here — sidestepping it removes a whole class of flakiness.
 
 ### Arming — implicit and continuous
@@ -426,7 +435,7 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | All thresholds expressed in palm-lengths | Image-normalized thresholds only work at the distance they were tuned at |
 | Buffer stores timestamps; velocity is Δx/Δt | "Never skip frames" is unenforceable; time-based derivatives make drops harmless |
 | Added buffer gap invalidation | Tracking loss mid-swipe otherwise produces a phantom fire |
-| Pose classification changed to radial distance from wrist | y-vs-PIP breaks on hand roll and is wrong for the thumb |
+| Pose classification changed to radial distance from wrist | y-vs-PIP breaks on hand roll and is wrong for the thumb. Measured: radial 100% vs naive 32% across a 360° sweep |
 | `OPEN_PALM` ignores the thumb | Least reliable landmark group, no benefit |
 | Specified `VIDEO` mode explicitly | `LIVE_STREAM` silently drops frames |
 | Capture thread demoted to insurance; main loop waits rather than polls | Measured: thread is worth ~0 at realistic load (26.8 vs 27.5 fps) and 25–31% only under overload; the AVFoundation deep-buffering claim was false. Polling burns 104% of a core for identical output |
