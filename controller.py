@@ -1,6 +1,6 @@
 """Gesture-controlled presentation controller.
 
-Build step 3: capture. Per the spec, steps 3-6 live in this one file; it splits
+Build steps 3-4: capture and hand tracking. Per the spec, steps 3-6 live in this one file; it splits
 into capture/gestures/actions/config/hud once the ring buffer lands.
 
     python controller.py                      # preview window
@@ -28,12 +28,34 @@ import time
 from dataclasses import dataclass
 
 import cv2
+import mediapipe as mp
+import numpy as np
+from mediapipe.tasks.python import BaseOptions, vision
+
+MODEL_PATH = "models/hand_landmarker.task"
 
 CAMERA_INDEX = 0
 FRAME_W, FRAME_H = 1280, 720
 # Matches Spike B's measured HandLandmarker cost, so the loop is loaded the way
 # the real pipeline will load it. Staleness measured against an idle loop lies.
 DEFAULT_WORK_MS = 5.1
+
+# Gates. A detection below either of these is discarded before it can reach the
+# ring buffer. MIN_PALM_PX exists because Spike B logged a 6.3px "palm", which
+# is physically impossible - confidence alone does not filter junk.
+MIN_CONFIDENCE = 0.6
+MIN_PALM_PX = 20.0
+
+# Standard MediaPipe 21-landmark topology.
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),            # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),            # index
+    (9, 10), (10, 11), (11, 12),               # middle
+    (13, 14), (14, 15), (15, 16),              # ring
+    (0, 17), (17, 18), (18, 19), (19, 20),     # pinky
+    (5, 9), (9, 13), (13, 17),                 # palm
+]
+WRIST, MIDDLE_MCP = 0, 9
 
 
 @dataclass(frozen=True)
@@ -174,6 +196,121 @@ class DirectGrabber:
         self.stop()
 
 
+@dataclass(frozen=True)
+class HandObservation:
+    """One frame of accepted hand data.
+
+    `landmarks` are MediaPipe's normalized 0-1 coordinates in the UNFLIPPED
+    image, which is the only frame of reference the rest of the pipeline uses.
+    Mirroring happens at draw time and nowhere else.
+
+    `palm_px` is the wrist-to-middle-MCP distance in source pixels. It is the
+    scale reference every later threshold divides by, so that a swipe means the
+    same physical gesture regardless of distance from the camera.
+    """
+    landmarks: list[tuple[float, float, float]]
+    palm_px: float
+    confidence: float
+    captured_at: float
+    frame_index: int
+
+
+class HandTracker:
+    """MediaPipe HandLandmarker in VIDEO mode, with the spec's gates applied.
+
+    VIDEO mode (not LIVE_STREAM) because it is synchronous and processes every
+    frame handed to it; LIVE_STREAM is callback-driven and silently drops frames
+    under load, which is exactly what corrupts velocity estimation.
+    """
+
+    def __init__(self, model_path: str = MODEL_PATH,
+                 min_confidence: float = MIN_CONFIDENCE,
+                 min_palm_px: float = MIN_PALM_PX):
+        self._min_confidence = min_confidence
+        self._min_palm_px = min_palm_px
+        self._landmarker = vision.HandLandmarker.create_from_options(
+            vision.HandLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=vision.RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        )
+        self._last_ts_ms = -1
+        self.infer_ms: list[float] = []
+        self.rejected = {"confidence": 0, "palm_px": 0}
+
+    def process(self, frame: Frame) -> HandObservation | None:
+        """Run inference on one frame. Returns None if no hand passed the gates."""
+        # Inference runs on the UNFLIPPED image - MediaPipe's handedness labels
+        # assume an unmirrored frame, and flipping first inverts every direction
+        # downstream.
+        rgb = cv2.cvtColor(frame.image, cv2.COLOR_BGR2RGB)
+
+        # detect_for_video requires strictly increasing timestamps or it raises.
+        ts_ms = max(int(frame.captured_at * 1000), self._last_ts_ms + 1)
+        self._last_ts_ms = ts_ms
+
+        t0 = time.perf_counter()
+        result = self._landmarker.detect_for_video(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts_ms
+        )
+        self.infer_ms.append((time.perf_counter() - t0) * 1000)
+
+        if not result.hand_landmarks:
+            return None
+
+        lm = result.hand_landmarks[0]
+        # NOTE: MediaPipe Tasks exposes the handedness classification score, not
+        # a per-frame detection confidence. It is a proxy, and a good one in
+        # practice (0.98 median in Spike B), but do not read it as "how sure the
+        # model is that this is a hand".
+        confidence = result.handedness[0][0].score if result.handedness else 0.0
+        if confidence < self._min_confidence:
+            self.rejected["confidence"] += 1
+            return None
+
+        h, w = frame.image.shape[:2]
+        palm_px = float(np.hypot(
+            (lm[MIDDLE_MCP].x - lm[WRIST].x) * w,
+            (lm[MIDDLE_MCP].y - lm[WRIST].y) * h,
+        ))
+        if palm_px < self._min_palm_px:
+            self.rejected["palm_px"] += 1
+            return None
+
+        return HandObservation(
+            landmarks=[(p.x, p.y, p.z) for p in lm],
+            palm_px=palm_px,
+            confidence=confidence,
+            captured_at=frame.captured_at,
+            frame_index=frame.index,
+        )
+
+    def close(self) -> None:
+        self._landmarker.close()
+
+    def __enter__(self) -> "HandTracker":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def draw_landmarks(view, obs: HandObservation, width: int, height: int) -> None:
+    """Draw the hand skeleton onto the MIRRORED preview.
+
+    `view` is already flipped for display, so x is mirrored here - the sole
+    place in the codebase where that happens.
+    """
+    pts = [(width - int(x * width), int(y * height)) for x, y, _ in obs.landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(view, pts[a], pts[b], (0, 255, 120), 2)
+    for pt in pts:
+        cv2.circle(view, pt, 3, (0, 200, 255), -1)
+
+
 def draw_hud(image, lines) -> None:
     """Outlined text, legible against any background."""
     for i, line in enumerate(lines):
@@ -194,86 +331,123 @@ def main() -> int:
     ap.add_argument("--headless", action="store_true", help="no preview window")
     ap.add_argument("--seconds", type=float, default=0, help="auto-exit after N seconds")
     ap.add_argument("--no-thread", action="store_true", help="unthreaded baseline")
-    ap.add_argument("--work-ms", type=float, default=DEFAULT_WORK_MS,
-                    help="simulated per-frame inference cost")
     ap.add_argument("--spin", action="store_true",
                     help="poll read() instead of waiting for a new frame")
+    ap.add_argument("--no-track", action="store_true",
+                    help="capture only; substitute simulated work for inference")
+    ap.add_argument("--work-ms", type=float, default=DEFAULT_WORK_MS,
+                    help="simulated per-frame cost when --no-track is set")
     args = ap.parse_args()
 
     Grabber = DirectGrabber if args.no_thread else FrameGrabber
     mode = "direct (unthreaded)" if args.no_thread else "threaded"
 
-    staleness, loop_ms = [], []
-    frames = repeats = 0
+    staleness: list[float] = []
+    palms: list[float] = []
+    confs: list[float] = []
+    gaps: list[float] = []            # continuous tracking dropouts, seconds
+    frames = repeats = hits = 0
     last_index = -1
+    miss_run_start: float | None = None
     t_start = time.perf_counter()
-    t_prev = t_start
     cpu_start = time.process_time()
 
-    print(f"capture: {mode}  work={args.work_ms:.1f}ms  "
+    print(f"capture: {mode}  tracking: {'off' if args.no_track else 'on'}  "
           f"{'headless' if args.headless else 'preview (q to quit)'}")
 
-    with Grabber(args.camera) as grabber:
-        while True:
-            frame = grabber.read() if args.spin else grabber.read_new(last_index)
-            if frame is None:
-                if args.seconds and time.perf_counter() - t_start > args.seconds:
+    tracker = None if args.no_track else HandTracker()
+    try:
+        with Grabber(args.camera) as grabber:
+            while True:
+                frame = grabber.read() if args.spin else grabber.read_new(last_index)
+                if frame is None:
+                    if args.seconds and time.perf_counter() - t_start > args.seconds:
+                        break
+                    continue
+
+                now = time.perf_counter()
+                if frame.index == last_index:
+                    repeats += 1
+                else:
+                    staleness.append((now - frame.captured_at) * 1000)
+                    last_index = frame.index
+                frames += 1
+
+                obs = None
+                if tracker is not None:
+                    obs = tracker.process(frame)
+                    if obs is not None:
+                        hits += 1
+                        palms.append(obs.palm_px)
+                        confs.append(obs.confidence)
+                        if miss_run_start is not None:
+                            gaps.append(now - miss_run_start)
+                            miss_run_start = None
+                    elif miss_run_start is None:
+                        miss_run_start = now
+                elif args.work_ms:
+                    spin_until = time.perf_counter() + args.work_ms / 1000
+                    while time.perf_counter() < spin_until:
+                        pass
+
+                if not args.headless:
+                    view = cv2.flip(frame.image, 1)
+                    h, w = view.shape[:2]
+                    if obs is not None:
+                        draw_landmarks(view, obs, w, h)
+                    elapsed = now - t_start
+                    draw_hud(view, [
+                        f"loop: {frames / max(elapsed, 1e-6):5.1f} fps   "
+                        f"stale: {staleness[-1] if staleness else 0:4.1f} ms",
+                        f"track: {hits / max(frames, 1) * 100:5.1f}%",
+                        f"palm: {obs.palm_px:5.1f} px" if obs else "palm:    -- px",
+                        f"conf: {obs.confidence:.2f}" if obs else "conf:  --",
+                    ])
+                    cv2.imshow("controller - step 4 hand tracking", view)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                if args.seconds and now - t_start > args.seconds:
                     break
-                continue
-
-            now = time.perf_counter()
-            if frame.index == last_index:
-                repeats += 1           # consumer outran the camera
-            else:
-                staleness.append((now - frame.captured_at) * 1000)
-                last_index = frame.index
-            frames += 1
-
-            # Stand in for HandLandmarker so the loop is realistically loaded.
-            if args.work_ms:
-                spin_until = time.perf_counter() + args.work_ms / 1000
-                while time.perf_counter() < spin_until:
-                    pass
-
-            loop_ms.append((now - t_prev) * 1000)
-            t_prev = now
-
-            if not args.headless:
-                view = cv2.flip(frame.image, 1)
-                elapsed = now - t_start
-                draw_hud(view, [
-                    f"mode: {mode}",
-                    f"loop: {frames / max(elapsed, 1e-6):5.1f} fps",
-                    f"stale: {staleness[-1]:5.1f} ms" if staleness else "stale:    -- ms",
-                    f"repeats: {repeats}",
-                ])
-                cv2.imshow("controller - step 3 capture", view)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-
-            if args.seconds and now - t_start > args.seconds:
-                break
-
-    if not args.headless:
-        cv2.destroyAllWindows()
+    finally:
+        if tracker is not None:
+            tracker.close()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
     elapsed = time.perf_counter() - t_start
     cpu = time.process_time() - cpu_start
-    reads = sorted(grabber.read_ms)
     stale = sorted(staleness)
-    print("\n" + "=" * 60)
-    print(f"mode           {mode}")
+    print("\n" + "=" * 62)
+    print(f"mode           {mode}, tracking {'off' if args.no_track else 'on'}")
     print(f"loop           {frames / max(elapsed, 1e-6):.1f} fps over {elapsed:.1f}s "
           f"({frames} frames, {repeats} repeats)")
-    print(f"cpu            {cpu:.1f}s of {elapsed:.1f}s wall = {cpu/max(elapsed,1e-6)*100:.0f}% of one core")
+    print(f"cpu            {cpu:.1f}s of {elapsed:.1f}s wall = "
+          f"{cpu / max(elapsed, 1e-6) * 100:.0f}% of one core")
     if stale:
-        print(f"staleness      median={st.median(stale):.1f}ms  p95={percentile(stale, .95):.1f}ms  "
-              f"max={stale[-1]:.1f}ms")
-    if reads:
-        print(f"read() blocked median={st.median(reads):.1f}ms  p95={percentile(reads, .95):.1f}ms")
-    print("=" * 60)
-    print("staleness is the spec's 0-33ms capture line: how old a frame already")
-    print("is when the pipeline receives it.")
+        print(f"staleness      median={st.median(stale):.1f}ms  "
+              f"p95={percentile(stale, .95):.1f}ms  max={stale[-1]:.1f}ms")
+    if tracker is not None:
+        infer = sorted(tracker.infer_ms)
+        print(f"tracking       {hits / max(frames, 1) * 100:.1f}% of {frames} frames")
+        if infer:
+            print(f"inference      median={st.median(infer):.1f}ms  "
+                  f"p95={percentile(infer, .95):.1f}ms")
+        if palms:
+            print(f"palm px        median={st.median(palms):.1f}  "
+                  f"min={min(palms):.1f}  max={max(palms):.1f}")
+        if confs:
+            print(f"confidence     median={st.median(confs):.2f}  min={min(confs):.2f}")
+        print(f"rejected       confidence={tracker.rejected['confidence']}  "
+              f"palm_px={tracker.rejected['palm_px']}")
+        if gaps:
+            ms = sorted(g * 1000 for g in gaps)
+            print(f"dropouts       count={len(ms)}  longest={ms[-1]:.0f}ms  "
+                  f"median={st.median(ms):.0f}ms  over_150ms={sum(1 for g in ms if g > 150)}")
+            print("               -> informs BUFFER_GAP_MS and ARM_EXIT_MS")
+        else:
+            print("dropouts       none")
+    print("=" * 62)
     return 0
 
 

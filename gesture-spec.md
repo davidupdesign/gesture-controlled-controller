@@ -160,6 +160,8 @@ Keep this section because the reasoning still applies if the geometry changes. M
 
 Note also that once the landmarker has acquired a hand it tracks from the previous frame's ROI and holds on far better than it acquires. **Cold-start acquisition is the hard case** — a system that looks fine after you have waved close to the camera may never acquire from a standing start.
 
+This two-stage design also shows up in the timings: inference costs **11.5ms median while searching** for a hand versus **5.1ms while tracking** one, because the palm detector runs on every frame until something is found. The expensive path is therefore the idle path, which is the harmless direction — you are not mid-gesture while the system is searching. Budget against 5.1ms for gesture latency and 11.5ms for steady-state CPU load.
+
 ---
 
 ## Gesture design
@@ -269,7 +271,8 @@ Target: **sub-200ms** from the swipe crossing the velocity threshold to the keys
 | Camera-side latency (sensor → `read()` returns) | **unmeasured** |
 | Pipeline-side staleness (measured) | 0.1ms med / 1.7ms max |
 | Colour convert + ROI crop + resize | ~2ms |
-| HandLandmarker inference (measured, M4 Max) | 5.1ms med / 7.5ms p95 |
+| HandLandmarker inference — **tracking** (measured) | 5.1ms med / 7.5ms p95 |
+| HandLandmarker inference — **acquiring** (measured) | 11.5ms med / 13.7ms p95 |
 | Classifier + state machine | <1ms |
 | Direction-consistency confirmation (4 frames) | ~130ms |
 | Keystroke dispatch (`pynput`, measured) | <0.1ms |
