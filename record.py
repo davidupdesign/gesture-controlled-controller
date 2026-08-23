@@ -32,7 +32,9 @@ from pathlib import Path
 
 import cv2
 
-from controller import FrameGrabber, HandTracker, draw_hud
+from capture import FrameGrabber
+from gestures import HandTracker
+from hud import draw_hud
 
 CLIPS_DIR = Path("clips")
 

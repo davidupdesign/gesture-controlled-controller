@@ -285,7 +285,7 @@ ARM_EXIT_LOST_MS      = 800     # tracking lost: long enough to ride out blips,
 
 # Swipe (all distances in palm-lengths)
 SWIPE_MIN_VELOCITY    = 8.0     # palm-lengths / second
-SWIPE_MIN_DISPLACE    = 2.5     # palm-lengths
+SWIPE_MIN_DISPLACE    = 0.8     # palm-lengths (was 2.5 - see below)
 SWIPE_CONSISTENT_N    = 4       # consecutive same-direction frames to confirm
 SWIPE_MAX_Y_DRIFT     = 1.5     # palm-lengths; rejects diagonal flails
 
@@ -300,6 +300,8 @@ COOLDOWN_MS           = 900
 ```
 
 **Single-frame velocity spikes are real, and `SWIPE_CONSISTENT_N` is what stops them.** Live runs recorded instantaneous `|vx|` maxima of 109 and 220 palm-lengths/sec — a hand moving ~20 m/s, physically impossible. These are landmark glitches, not buffer discontinuities: the run with the 220 palm/s spike had *zero* gap invalidations. Velocity thresholding on its own would fire on every one. Requiring consecutive same-direction frames is therefore not a refinement, it is load-bearing, and no velocity threshold should ever be applied without it.
+
+**`SWIPE_MIN_DISPLACE` was structurally incompatible with firing early.** The original 2.5 palm-lengths cannot coexist with confirmation over `SWIPE_CONSISTENT_N` frames: four frames at the velocity floor travel only ~0.5 palm-lengths, so a 2.5 threshold forces the classifier to wait roughly 600ms for displacement to accumulate — reintroducing exactly the completed-gesture latency the fire-early rule exists to avoid. The two parameters are coupled, and any value beyond `SWIPE_MIN_VELOCITY × SWIPE_CONSISTENT_N / fps` delays firing past the frame confirmation. This is a logic correction, not a tuning; the value still gets fitted in step 9.
 
 **Fire on velocity-threshold crossing, not on completed displacement.** Confirm with `SWIPE_CONSISTENT_N` same-direction frames (~130ms at 30fps) rather than waiting for the full gesture to finish. This is the difference between "instant" and "laggy" and costs nothing in false-positive rate, because the pose and height gates are doing the real filtering.
 
@@ -397,7 +399,11 @@ The false-fire number is the one that matters. A controller that misses a swipe 
 - *Y-drift rejection*: `SWIPE_MAX_Y_DRIFT` rejects diagonal flails
 - *Confidence floor*: discard frames below `MIN_CONFIDENCE`
 
-**Debouncing.** One physical swipe spans 10–20 frames. Without a cooldown, one swipe fires 15 slide advances. `COOLDOWN_MS` plus buffer-clearing on state transition handles this.
+**Debouncing.** One physical swipe spans 10–20 frames. Without a cooldown, one swipe fires 15 slide advances.
+
+**Resetting the run after firing does not solve this, which is easy to get wrong.** The obvious implementation — clear the run once it fires — still double-fires, because the hand is *still moving* when the swipe is confirmed. A fresh run starts on the very next frame and re-confirms `SWIPE_CONSISTENT_N` frames later. A 20-frame sweep fired three times under exactly that implementation.
+
+The fix is a **spent flag**: firing marks the run spent rather than clearing it, and the run is released only when the motion stops qualifying — the pose breaks, the velocity drops, or the direction reverses. That guarantees one fire per physical gesture without any timer. `COOLDOWN_MS` remains on top of it as a separate guard against deliberate rapid re-swiping, not as the primary debounce.
 
 **Focus.** `pyautogui` sends keys to whatever window is focused. If the HUD has focus, the script keys itself. The HUD must be non-activating and always-on-top; headless mode must be available as a flag regardless.
 
@@ -470,6 +476,8 @@ Steps 7 and 9 are the ones under schedule pressure that will feel skippable. The
 | Documented mirroring and direction conventions | Classic multi-hour bug |
 | Fire on velocity crossing, not completed displacement | Displacement-window confirmation cannot feel instant |
 | Removed the `DETECTING` state | The ring buffer already is that state |
+| `SWIPE_MIN_DISPLACE` 2.5 → 0.8 | 2.5 is incompatible with firing on velocity: 4 frames at the floor travel ~0.5 palm-lengths, so 2.5 forces a ~600ms wait and reintroduces completed-gesture latency |
+| Debounce via a spent-run flag, not reset-after-fire | Resetting still double-fires because the hand is still moving when confirmed; a 20-frame sweep fired three times |
 | Cut fist → blank screen | Relaxed hand reads as partial fist; highest-cost false positive |
 | Added tuning harness and fixture set (steps 7, 9) | A gesture classifier cannot be tuned interactively |
 | Added *Definition of done* with measurable criteria | v1 had no acceptance criteria at all |

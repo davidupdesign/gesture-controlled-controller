@@ -10,13 +10,8 @@ import math
 
 import pytest
 
-from controller import (
-    FINGER_JOINTS,
-    HandObservation,
-    fingers_up,
-    format_fingers,
-    is_open_palm,
-)
+from gestures import FINGER_JOINTS, HandObservation, fingers_up, is_open_palm
+from hud import format_fingers
 
 # Radii along each finger's axis, in arbitrary units from the wrist.
 JOINT_RADII = {"mcp": 1.0, "pip": 1.45, "dip": 1.8}

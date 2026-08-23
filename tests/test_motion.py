@@ -11,7 +11,8 @@ import math
 
 import pytest
 
-from controller import BUFFER_GAP_MS, WRIST, HandObservation, MotionBuffer
+from config import BUFFER_GAP_MS
+from gestures import WRIST, HandObservation, MotionBuffer
 
 
 def observation(t, wrist_x, wrist_y=0.5, palm_units=0.1, aspect=1.0):
